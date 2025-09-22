@@ -21,4 +21,12 @@ class MyDataSet(Dataset):
     
     # 对数据作定制化处理
     def __getitem__(self, item):
-        pass
+        text = self.dataset[item]["text"]
+        label = self.dataset[item]["label"]
+        return text, label
+    
+if __name__ == "__main__":
+    dataset = MyDataSet("validation")
+    for data in dataset:
+        print(data)
+        
