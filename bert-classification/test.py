@@ -1,67 +1,63 @@
+import os
 import torch
-from mydataset import Mydataset
 from torch.utils.data import DataLoader
-from network import Model
-from transformers import AdamWeightDecay, BertTokenizer
+from transformers import BertTokenizer
+from dataset import MyDataset
+from modeling import Model
+from metrics import evaluate_loader
 
-# 定义训练设备
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+MODEL_NAME = "bert-base-chinese"
+MAX_LENGTH = 256
+BATCH_SIZE = 64
+CKPT_PATH = "outputs/bert-chinese-sentiment/best_model.pt"
 
-token = BertTokenizer.from_pretrained("bert-base-chinese")
+tokenizer = BertTokenizer.from_pretrained(MODEL_NAME)
 
-# 自定义函数对数据进行编码处理
-def collate_fn(data):
-    sentence = [idx[0] for idx in data]
-    label = [idx[1] for idx in data]
-    # 编码处理
-    data = token.batch_encode_plus(
-        batch_text_or_text_pairs=sentence,
+def collate_fn(batch):
+    sentences = [x[0] for x in batch]
+    labels = torch.tensor([x[1] for x in batch], dtype=torch.long)
+    
+    enc = tokenizer.batch_encode_plus(
+        sentences,
         truncation=True,
-        padding="max_length",
-        max_length=350,
-        return_tensors="pt",
-        return_length=True
+        padding=True,
+        max_length=MAX_LENGTH,
+        return_tensor="pt",
+        return_attention_mask=True
     )
     
-    input_ids = data["input_ids"]
-    attention_mask = data["attention_mask"]
-    token_type_ids = data["token_type_ids"]
-    labels = torch.LongTensor(label)
-    
-    return input_ids, attention_mask, token_type_ids, labels
-    
-# 创建数据集 
-test_dataset = Mydataset("test")
+    input_ids = enc["input_ids"]
+    attention_mask = enc["attention_mask"]
+    token_type_ids = enc.get("token_type_ids", torch.zeros_like(input_ids))
+    return input_ids, attention_mask, token_type_ids
 
-test_loader = DataLoader(
-    dataset=test_dataset,
-    batch_size=64,
-    shuffle=True,
-    drop_last=True,
-    collate_fn=collate_fn
-)
-
-if __name__ == "__main__":
-    # 开始训练
-    acc = 0
-    total = 0
+def main():
+    test_ds = MyDataset("test")
+    test_loader = DataLoader(
+        test_ds,
+        batch_size=BATCH_SIZE,
+        shuffle=False,
+        drop_last=False,
+        collate_fn=collate_fn,
+        num_workers=2,
+        pin_memory=torch.cuda.is_available(),
+    )
     
-    print(DEVICE)
-    model = Model.to(DEVICE)
-    model.load_state_dict(torch.load("params/2bert.pt"))
-    model.eval()
+    model = Model().to(DEVICE)
+    if not os.path.exists(CKPT_PATH):
+        raise FileNotFoundError(f"could not find weights: {CKPT_PATH}")
+    model.load_state_dict(torch.load(CKPT_PATH, map_location=DEVICE))
     
-    for i, (input_ids, attention_mask, token_type_ids, labels) in enumerate(test_loader):
-        # 将数据放到DEVICE上
-        input_ids = input_ids.to(DEVICE)
-        attention_mask = attention_mask.to(DEVICE)
-        token_type_ids = token_type_ids.to(DEVICE)
-        labels = labels.to(DEVICE)
-        
-        out = model(input_ids, attention_mask, token_type_ids)
-        
-        acc = (out == labels).sum().item()
-        total += len(labels)
+    criterion = torch.nn.CrossEntropyLoss()
     
-    print(acc/total)
-    
+    results = evaluate_loader(model, test_loader, DEVICE, criterion=criterion)
+    print("== Test Results ==")
+    if results["loss"] is not None:
+        print(f"loss: {results['loss']:.4f}")
+    print(f"accuracy: {results['accuracy']:.4f}")
+    print(f"precision: {results['precision']:.4f}")
+    print(f"recall: {results['recall']:.4f}")
+    print(f"f1: {results['f1']:.4f}")
+    print(f"confusion_matrix:\n", results["confusion_matrix"])
+    print(f"classification_report:\n", results["report"])

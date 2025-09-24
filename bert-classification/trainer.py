@@ -1,77 +1,168 @@
+import os
+import random
+import numpy as np
 import torch
-from mydataset import Mydataset
 from torch.utils.data import DataLoader
-from network import Model
-from transformers import BertTokenizer, AdamWeightDecay
+from torch.optim import AdamW
+from transformers import BertTokenizer, DataCollatorWithPadding
+from sklearn.metrics import accuracy_score, f1_score
 
-# 定义训练设备
+from dataset import MyDataset
+from modeling import Model
+from metrics import evaluate_loader
+
+# ----------------------
+# Define hyperparameter
+# ----------------------
+MODEL_NAME = "bert-base-chinese"
+MAX_LENGTH = 256
+TRAIN_BATCH_SIZE = 32
+EVAL_BATCH_SIZE = 64
+LR = 2e-5
+WEIGHT_DECAY = 0.01
+NUM_EPOCH = 5
+GRAD_CLIP_NORM = 1.0
+SEED = 42
+OUTPUT_DIR = "outputs/bert-chinese-sentiment"
+BEST_PATH = os.path.join(OUTPUT_DIR, "best_model_pt")
+
+# ----------------------
+# device & random seed
+# ----------------------
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-EPOCH = 100
+def set_seed(seed=SEED):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+        
+# ensure the reproductibility of the experiment
+set_seed(SEED)
 
-token = BertTokenizer.from_pretrained("bert-base-chinese")
+# ----------------------
+# Tokenizer & collator
+# ----------------------
+tokenizer = BertTokenizer.from_pretrained(MODEL_NAME) # Convert natural language text into numerical input
+# Align the samples in a batch to a uniform length, and then package them into a tensor
+collator = DataCollatorWithPadding(
+    tokenizer=tokenizer,
+    pad_to_multiple_of=8 if torch.cuda.is_available() else None
+)
 
-# 自定义函数对数据进行编码处理
-def collate_fn(data):
-    sentence = [idx[0] for idx in data]
-    label = [idx[1] for idx in data]
+# ----------------------
+# Customize collate_fn: Encode in batch
+# return (input_ids, attention_mask, token_type_ids, labels)
+# ----------------------
+def collate_fn(batch):
+    sentences = [x[0] for x in batch]
+    labels = torch.tensor([x[1] for x in batch], dtype=torch.long)
     # 编码处理
-    data = token.batch_encode_plus(
-        batch_text_or_text_pairs=sentence,
+    enc = tokenizer.batch_encode_plus(
+        sentences,
         truncation=True,
-        padding="max_length",
-        max_length=350,
+        padding=True,           # We have used DataCollator
+        max_length=MAX_LENGTH,
         return_tensors="pt",
         return_length=True
     )
     
-    input_ids = data["input_ids"]
-    attention_mask = data["attention_mask"]
-    token_type_ids = data["token_type_ids"]
-    labels = torch.LongTensor(label)
+    input_ids = enc["input_ids"]
+    attention_mask = enc["attention_mask"]
+    token_type_ids = enc.get("token_type_ids", torch.zeros_like(input_ids))
     
     return input_ids, attention_mask, token_type_ids, labels
     
-# 创建数据集 
-train_dataset = Mydataset("train")
+    
+# --------------------
+# Dataset & DataLoader
+# --------------------
+train_ds = MyDataset("train")
+val_ds = MyDataset("validation")
 
 train_loader = DataLoader(
-    dataset=train_dataset,
-    batch_size=64,
+    dataset=train_ds,
+    batch_size=TRAIN_BATCH_SIZE,
     shuffle=True,
-    drop_last=True,
-    collate_fn=collate_fn
+    drop_last=False,
+    collate_fn=collate_fn,
+    num_workers=2,
+    pin_memory=torch.cuda.is_available(),
 )
 
+val_loader = DataLoader(
+    dataset=val_ds,
+    batch_size=EVAL_BATCH_SIZE,
+    shuffle=True,
+    drop_last=False,
+    collate_fn=collate_fn,
+    num_workers=2,
+    pin_memory=torch.cuda.is_available(),
+)
+
+# --------------------
+# Model, Optimizer, AMP
+# --------------------
+model = Model().to(DEVICE)
+optimizer = AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+# Automatically scale gradients during FP16 training.
+scaler = torch.GradScaler(device='cuda', enabled=torch.cuda.is_available())
+criterion = torch.nn.CrossEntropyLoss()
+
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+best_f1 = -1.0
+
+# ----------------------
+# Training loop
+# ----------------------   
 if __name__ == "__main__":
-    # 开始训练
-    print(DEVICE)
-    model = Model.to(DEVICE)
-    optimizer = AdamWeightDecay(model.parameters(), lr=5e-4)
-    loss_func = torch.nn.CrossEntropyLoss()
-    
-    model.train()
-    for epoch in range(EPOCH):
-        for i, (input_ids, attention_mask, token_type_ids, labels) in enumerate(train_loader):
-            # 将数据放到DEVICE上
-            input_ids = input_ids.to(DEVICE)
-            attention_mask = attention_mask.to(DEVICE)
-            token_type_ids = token_type_ids.to(DEVICE)
-            labels = labels.to(DEVICE)
+
+    print("Device:", DEVICE)
+    step = 0
+    for epoch in range(1, NUM_EPOCH + 1):
+        model.train()
+        for input_ids, attention_mask, token_type_ids, labels in train_loader:
+            input_ids = input_ids.to(DEVICE, non_blocking=True)
+            attention_mask = attention_mask.to(DEVICE, non_blocking=True)
+            token_type_ids = token_type_ids.to(DEVICE, non_blocking=True)
+            labels = labels.to(DEVICE, non_blocking=True)
             
-            out = model(input_ids, attention_mask, token_type_ids)
+            # Clear the previous gradients
+            optimizer.zero_grad(set_to_none=True) 
+            # Mixed Precision Computing           
+            with torch.autocast(device_type='cuda',enabled=torch.cuda.is_available()):
+                logits = model(input_ids, attention_mask, token_type_ids)
+                loss = criterion(logits, labels)
             
-            loss = loss_func(out, labels)
+            # Scale the loss before performing backpropagation
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            # Gradient clipping
+            torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_NORM)
+            # Update parameters using the optimizer
+            scaler.step(optimizer)
+            # Dynamically adjust the scaling factor
+            scaler.update()
             
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            
-            if i%5 == 0:
-                out = out.argmax(dim=1)
-                acc = (out == labels).sum().item() / len(labels)
-                print(epoch, i, loss.item(), acc)
+            if step % 50 == 0:
+                preds = logits.argmax(dim=1)
+                acc = (preds == labels).float().mean().item()
+                print(f"[Epoch {epoch}] step {step} | loss={loss.item():.4f} | acc={acc:.4f}")
+            step += 1
         
-        # 保存模型参数
-        torch.save(model.state_dict(), f"params/{epoch}bert.pt")
-        print(epoch, "参数保存成功！")
+        # evalute each epoch
+        criterion = torch.nn.CrossEntropyLoss()
+        metrics = evaluate_loader(model, val_loader, DEVICE, criterion=criterion)
+        print(f"==> Eval @ Epoch {epoch}:"
+              f"loss={metrics['loss']:.4f}"
+              f"acc={metrics['accuracy']:.4f}"
+              f"f1={metrics['f1']:.4f}")
+        
+        # save the best
+        if metrics["f1"] > best_f1:
+            best_f1 = metrics["f1"]
+            torch.save(model.state_dict(), BEST_PATH)
+            print(f"Saved best model to {BEST_PATH} (val_f1={best_f1:.4f})")
+
+    print("Training done. Best F1:", best_f1)
     
