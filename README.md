@@ -6,7 +6,7 @@
 
 - Multi-class (6-way) sentiment classification on a Weibo COVID-19 emotion dataset (labels: `neutral`, `happy`, `angry`, `sad`, `fear`, `surprise`). 
 
-- news topic classification with sliding-window chunking on THUNews dataset (labels: `sport`, `health`, `finance`, `entertainment`, `tech`, `game`).
+- News topic classification with sliding-window chunking on THUNews dataset (labels: `sport`, `health`, `finance`, `entertainment`, `tech`, `game`).
 
 ---
 
@@ -114,7 +114,7 @@
 
 ---
 
-## 🔑 Pipelines
+## Pipelines
 
 The implementation follows the standard fine-tuning procedure for downstream tasks with BERT:
 
@@ -169,7 +169,7 @@ Top-3: happy=0.920, neutral=0.050, surprise=0.015
 - Compare `truncation_side={"right","left"}` at `max_length ∈ {128, 256}`; keep configs identical across train/val/test.
 
 ### 3. Model & Head
-- `bert-base-chinese` backbone. Head options: **pooler_output**, **raw [CLS]**, **mean pooling** (switchable).
+- `bert-base-chinese` backbone. Head option: **pooler_output**.
 
 ### 4. Training
 - Loss: CE (optionally class-weighted). Optimizer: AdamW, LR=2e-5, WD=0.01.  
