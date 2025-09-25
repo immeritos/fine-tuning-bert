@@ -14,13 +14,12 @@ from transformers import (
 
 from dataset import MyDataset
 
-# 定义训练设备
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 MODEL_NAME = "bert-base-chinese"
 NUM_LABELS = 6
 MAX_LENGTH = 256
 BATCH_SIZE = 64
-CKPT_PATH = "outputs/bert-chinese-sentiment/best_model.pt"
+CKPT_PATH = "outputs/bert-chinese-sentiment/best_model_pt"
 
 def build_collate(tokenizer, max_length):
     collator = DataCollatorWithPadding(
@@ -47,7 +46,9 @@ def build_collate(tokenizer, max_length):
             features.append(feat)
             
         batch_tensor = collator(features)
-        return collate_fc
+        return batch_tensor
+    
+    return collate_fc
 
 def compute_metrics(logits, labels):
     
@@ -102,7 +103,6 @@ def main():
     trainer = Trainer(
         model=model,
         args=args,
-        processing_class=tokenizer,
         data_collator=collate_fn,
     )
 
