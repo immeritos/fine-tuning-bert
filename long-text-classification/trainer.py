@@ -1,82 +1,229 @@
+import os
+from typing import List, Dict, Any, Tuple
+from transformers import (
+    BertTokenizerFast,
+    BertForSequenceClassification,
+    DataCollatorWithPadding,
+    TrainingArguments,
+    Trainer,
+    PreTrainedTokenizerBase,
+)
+from transformers.trainer_callback import EarlyStoppingCallback, TrainerCallback
+from transformers.trainer_utils import EvalPrediction
+import numpy as np
 import torch
-from mydataset import Mydataset
+import torch.nn as nn
 from torch.utils.data import DataLoader
-from network import Model
-from transformers import BertTokenizer, AdamWeightDecay
 
-# 定义训练设备
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-EPOCH = 30000
+from dataset import MyDataset
 
-# 导入预训练好的分词器
-# 如果分词器在本地，需使用绝对路径
-token = BertTokenizer.from_pretrained("bert-base-chinese")
+MODEL_NAME = "bert-base-chinese"
+MAX_LENGTH = 512
+STRIDE = 160
+NUM_LABELS = 6
+TRAIN_BATCH_SIZE = 16
+EVAL_BATCH_SIZE = 32
+LR = 2e-5
+WEIGHT_DECAY = 0.01
+NUM_EPOCH = 5
+GRAD_CLIP_NORM = 1.0
+SEED = 42
+OUTPUT_DIR = "outputs/bert-chinese-news"
+BEST_PATH = os.path.join(OUTPUT_DIR, "best_model_pt")
 
-# 自定义函数对数据进行编码处理
-def collate_fn(data):
-    sentence = [idx[0] for idx in data]
-    label = [idx[1] for idx in data]
-    # 编码处理
-    data = token.batch_encode_plus(
-        batch_text_or_text_pairs=sentence,
-        truncation=True,
-        padding="max_length",
-        max_length=1500,
-        return_tensors="pt",
-        return_length=True  
+# ---------- Collate: Pad sequences + Preserve document metadata ----------
+def build_collate(tokenizer, max_length):
+    collator = DataCollatorWithPadding(
+        tokenizer=tokenizer,
+        pad_to_multiple_of=8 if torch.cuda.is_available() else None
     )
     
-    input_ids = data["input_ids"]
-    attention_mask = data["attention_mask"]
-    token_type_ids = data["token_type_ids"]
-    labels = torch.LongTensor(label)
+    def collate_fc(batch):
+        features = []
+        meta_keys = ("doc_id", "chunk_idx", "num_chunks")
+        for ex in batch:
+            feat = {
+                k: ex[k]
+                for k in ("input_ids", "attention_mask", "token_type_ids")
+                if k in ex
+            }
+            if "labels" in ex:
+                feat["labels"] = int(ex["labels"])
+            else:
+                feat["labels"] = int(ex["label"])
+            for k in meta_keys:
+                if k in ex:
+                    feat[k] = ex[k]
+            features.append(feat)
+            
+        batch_tensor = collator(features)
+        for k in ("doc_id", "chunk_idx", "num_chunks", "labels"):
+            if k in batch_tensor and not torch.is_tensor(batch_tensor[k]):
+                batch_tensor[k] = torch.tensor(batch_tensor[k], dtype=torch.long)
+                
+        return batch_tensor
     
-    return input_ids, attention_mask, token_type_ids, labels
+    return collate_fc
     
-# 创建数据集 
-train_dataset = Mydataset("train")
+def freeze_backbone(model):
+    for p in model.bert.parameters():
+        p.requires_grad=False
+    model.bert.eval()
+    return model
 
-# 创建dataloader
-train_loader = DataLoader(
-    dataset=train_dataset,
-    batch_size=64,
-    shuffle=True,
-    drop_last=True,
-    collate_fn=collate_fn
-)
-
-
-if __name__ == "__main__":
-    # 开始训练
-    print(DEVICE)
-    model = Model.to(DEVICE)
-    optimizer = AdamWeightDecay(model.parameters(), lr=5e-4)
-    loss_func = torch.nn.CrossEntropyLoss()
+class TrainerForChunks(Trainer):
+    def __init__(self, *args, agg: str = "mean", **kwargs):
+        super().__init__(*args, **kwargs)
+        assert agg in {"mean", "logsumexp"}
+        self.agg = agg
+        self._ce = nn.CrossEntropyLoss()
     
-    model.train()
-    for epoch in range(EPOCH):
-        # 训练
-        for i, (input_ids, attention_mask, token_type_ids, labels) in enumerate(train_loader):
-            # 将数据放到DEVICE上
-            input_ids = input_ids.to(DEVICE)
-            attention_mask = attention_mask.to(DEVICE)
-            token_type_ids = token_type_ids.to(DEVICE)
-            labels = labels.to(DEVICE)
-            
-            out = model(input_ids, attention_mask, token_type_ids)
-            
-            loss = loss_func(out, labels)
-            
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            
-            if i%5 == 0:
-                out = out.argmax(dim=1)
-                acc = (out == labels).sum().item() / len(labels)
-                print(epoch, i, loss.item(), acc)      
+    def _aggregate_logits(
+        self, logits: torch.Tensor, doc_ids: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        return :
+            doc_logits: [num_docs_in_batch, num_labels]
+            doc_ids_unique: [num_docs_in_batch]
+        """
+        order = torch.argsort(doc_ids)
+        doc_ids_sorted = doc_ids[order]
+        logits_sorted = logits[order]
         
-        # 保存模型参数
-        torch.save(model.state_dict(), f"params/{epoch}bert.pt")
-        print(epoch, "参数保存成功！")
+        uniques, counts = torch.unique_consecutive(doc_ids_sorted, return_counts=True)
+        splits = torch.split(logits_sorted, tuple(counts.tolist()))
+        
+        doc_logits_list = []
+        for chunk_logits in splits:
+            if self.agg == "mean":
+                doc_logits_list.append(chunk_logits.mean(dim=0))
+            else:
+                doc_logits_list.append(torch.logsumexp(chunk_logits, dim=0))
+        doc_logits = torch.stack(doc_logits_list, dim=0)
+        return doc_logits, uniques
     
+    def compute_loss(self, model, inputs, return_outputs=False):
+        labels = inputs.pop("labels")
+        doc_ids = inputs.pop("doc_id")
+        outputs = model(**inputs)
+        logits = outputs.logits
+        
+        doc_logits, uniques = self._aggregate_logits(logits, doc_ids)
+        order = torch.argsort(doc_ids)
+        labels_sorted = labels[order]
+        _, counts = torch.unique_consecutive(doc_ids[order], return_counts=True)
+        start_idx = torch.cumsum(torch.tensor([0] + counts[:-1].tolist()), dim=0)
+        doc_labels = labels_sorted[start_idx]
+        
+        loss = self._ce(doc_logits, doc_labels)
+        return (loss, outputs) if return_outputs else loss
+
+    
+def main():
+    # 1) data & tokenizer
+    tokenizer = BertTokenizerFast.from_pretrained(MODEL_NAME)
+    train_ds = MyDataset(
+        "train",
+        tokenizer=tokenizer,
+        max_length=MAX_LENGTH,
+        stride=STRIDE,
+    )
+    val_ds = MyDataset(
+        "validation",
+        tokenizer=tokenizer,
+        max_length=MAX_LENGTH,
+        stride=STRIDE,
+    )
+    
+    collate_fn = build_collate(tokenizer, max_length=MAX_LENGTH)
+
+    
+    # 2) model
+    id2label = {i: f"label_{i}" for i in range(NUM_LABELS)}
+    label2id = {v: k for k, v in id2label.items()}
+    model = BertForSequenceClassification.from_pretrained(
+        MODEL_NAME,
+        num_labels=NUM_LABELS,
+        id2label=id2label,
+        label2id=label2id,
+    )
+    
+    freeze_backbone(model)
+    
+    args = TrainingArguments(
+        output_dir=OUTPUT_DIR,
+        learning_rate=LR,
+        per_device_train_batch_size=TRAIN_BATCH_SIZE,
+        per_device_eval_batch_size=EVAL_BATCH_SIZE,
+        num_train_epochs=NUM_EPOCH,
+        weight_decay=WEIGHT_DECAY,
+        eval_strategy="epoch",
+        save_strategy="epoch",
+        load_best_model_at_end=True,
+        metric_for_best_model="accuracy",
+        greater_is_better=True,
+        logging_steps=50,
+        fp16=torch.cuda.is_available(),
+        report_to="none",
+        remove_unused_columns=False,
+        seed=SEED,
+        max_grad_norm=GRAD_CLIP_NORM,
+    )
+    
+    eval_doc_ids = np.array([val_ds[i]["doc_id"] for i in range(len(val_ds))], dtype=np.int64)
+    doc_first_index = {}
+    for i, d in enumerate(eval_doc_ids):
+        if d not in doc_first_index:
+            doc_first_index[d] = i
+    eval_doc_labels = np.array(
+        [int(val_ds[idx]["labels"] if "labels" in val_ds[idx] else val_ds[idx]["label"])
+         for d, idx in sorted(doc_first_index.items(), key=lambda x: x[0])],
+        dtype=np.int64
+    )
+    eval_doc_ids_unique = np.array(sorted(doc_first_index.keys()), dtype=np.int64)
+    
+    def compute_metrics(eval_pred: EvalPrediction):
+        logits = eval_pred.predictions
+        if isinstance(logits, tuple):
+            logits = logits[0]
+        
+        order = np.argsort(eval_doc_ids)
+        doc_ids_sorted = eval_doc_ids[order]
+        logits_sorted = logits[order]
+        
+        doc_logits = []
+        start = 0
+        for d in eval_doc_ids_unique:
+            end = start
+            while end < len(doc_ids_sorted) and doc_ids_sorted[end] == d:
+                end += 1
+            doc_logits.append(logits_sorted[start:end].mean(axis=0, keepdims=False))
+            start = end
+        doc_logits = np.stack(doc_logits, axis=0)
+        
+        preds = doc_logits.argmax(axis=-1)
+        acc = (preds == eval_doc_labels).mean().item()
+        return {"accuracy": acc}
+
+    callbacks: list[TrainerCallback] = [
+        EarlyStoppingCallback(early_stopping_patience=3, early_stopping_threshold=0.0)
+    ]
+    trainer = TrainerForChunks(
+        model=model,
+        args=args,
+        train_dataset=train_ds,
+        eval_dataset=val_ds,
+        tokenizer=tokenizer,
+        data_collator=collate_fn,
+        compute_metrics=compute_metrics,
+        callbacks=callbacks,
+        agg="mean",
+    )
+    
+    trainer.train()
+    print(trainer.evaluate())
+    trainer.save_model(BEST_PATH)
+    tokenizer.save_pretrained(BEST_PATH)
+    
+if __name__ == "__main__":
+    main()

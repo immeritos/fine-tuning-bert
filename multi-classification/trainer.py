@@ -50,7 +50,9 @@ def build_collate(tokenizer, max_length):
             features.append(feat)
             
         batch_tensor = collator(features)
-        return collate_fc
+        return batch_tensor
+    
+    return collate_fc
     
 def freeze_backbone(model):
     for p in model.bert.parameters():
