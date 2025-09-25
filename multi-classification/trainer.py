@@ -113,7 +113,6 @@ def main():
         args=args,
         train_dataset=train_ds,
         eval_dataset=val_ds,
-        processing_class=tokenizer,
         data_collator=collate_fn,
         compute_metrics=compute_metrics,
         callbacks=callbacks,
