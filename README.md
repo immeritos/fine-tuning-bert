@@ -21,14 +21,15 @@
 - **`metrics.py`** (optional): metrics helpers (Macro-F1, ROC/PR-AUC, confusion matrix).
 - **`collate_fn`**: padding to batch max length; keep metadata; return tensors.
 
-```bash
+```
+bash
 .
-├─ Dataset.py                 # your custom torch Dataset -> returns (text, label)
-├─ trainer.py                 # Trainer-based training (6-way)
-├─ test.py                    # evaluation using Trainer.predict
-├─ inference.py               # CLI inference (single/batch text)
-├─ metrics.py                 # (optional) sklearn metrics helper
-└─ data/                      # dataset storage (HF load_from_disk or raw)
+├─ Dataset.py          
+├─ trainer.py 
+├─ test.py    
+├─ inference.py 
+├─ metrics.py   
+└─ data/   
 ```
 
 ---
