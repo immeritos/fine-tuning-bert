@@ -40,7 +40,7 @@ bash
   - `input_ids`: vocabulary indices.  
   - `attention_mask`: 1 for real tokens, 0 for padding (used to mask attention).  
   - `token_type_ids` (segment IDs): sentence-pair A/B (single-sentence tasks are all-zeros).  
-- **`return_tensors`**: `"pt"` (PyTorch), `"tf"`, or `"np"`; set to `"pt"` to get ready-to-model tensors immediately.
+- **`return_tensors`**: `"pt"` (PyTorch), `"tf"`, or `"np".
 - **Truncation side** (`tokenizer.truncation_side`):  
   - `"right"` keeps the beginning and truncates the end (default).  
   - `"left"` keeps the end and truncates the beginning.  
@@ -49,12 +49,10 @@ bash
 
 ---
 
-### 2. [CLS], Pooler, and Pooling Choices
-- **`[CLS]`**: the first token’s contextual representation; commonly used as sentence embedding.
+### 2. Pooling Choices
 - **`pooler_output`**: `tanh(W·[CLS] + b)` — a dense + Tanh projection historically used in BERT’s NSP; simple and stable.
-- **Alternatives**:  
-  - **raw `[CLS]`** (no Tanh): sometimes retains more information.  
-  - **mean pooling** over `last_hidden_state` (mask-aware): more robust when info is distributed / noisy.
+- **raw `[CLS]`** (no Tanh): the first token’s contextual representation; sometimes retains more information.  
+- **mean pooling** over `last_hidden_state` (mask-aware): more robust when info is distributed / noisy.
 - **Recommendation**: expose a switch (pooled | cls | mean) and compare Macro-F1 on validation.
 
 ---
