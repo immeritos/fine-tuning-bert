@@ -21,8 +21,7 @@
 - **`metrics.py`** (optional): metrics helpers (Macro-F1, ROC/PR-AUC, confusion matrix).
 - **`collate_fn`**: padding to batch max length; keep metadata; return tensors.
 
-```
-bash
+```bash
 .
 ├─ Dataset.py          
 ├─ trainer.py 
@@ -203,7 +202,7 @@ Top-3: happy=0.920, neutral=0.050, surprise=0.015
 - Optional: Focal loss if minority emotions suffer.
 
 ### 5. Evaluation
-- Primary: **Macro-F1** + per-class F1; confusion matrix to inspect pairs like “娱乐↔游戏/搞笑”。  
+- Primary: **Macro-F1** + per-class F1; confusion matrix to inspect pairs like “悲伤↔愤怒/厌恶”。  
 - Optional: macro PR-AUC (OvR).
 
 ### 6. Inference & Explainability
